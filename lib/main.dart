@@ -1,9 +1,17 @@
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
-import 'views/home_screen.dart';
+import 'screens/scan_screen.dart';
 
-void main() {
+List<CameraDescription> cameras = [];
+
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  try {
+    cameras = await availableCameras();
+  } catch (e) {
+    debugPrint('Gagal mendeteksi kamera: $e');
+  }
   runApp(const BrailleScanApp());
 }
 
@@ -16,9 +24,10 @@ class BrailleScanApp extends StatelessWidget {
       title: 'BrailleScan AI',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
       ),
-      home: const HomeScreen(),
+      home: ScanScreen(cameras: cameras),
     );
   }
 }

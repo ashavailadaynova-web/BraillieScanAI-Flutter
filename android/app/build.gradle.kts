@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.braille_scan_ai"
+    namespace = "com.braillescan.braillescan_ai"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -19,9 +19,13 @@ android {
         jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
+    aaptOptions {
+        noCompress += "tflite"
+    }
+
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.braille_scan_ai"
+        applicationId = "com.braillescan.braillescan_ai"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion

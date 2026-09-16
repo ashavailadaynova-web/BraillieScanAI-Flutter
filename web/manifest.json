@@ -1,6 +1,6 @@
 {
-    "name": "braille_scan_ai",
-    "short_name": "braille_scan_ai",
+    "name": "braillescan_ai",
+    "short_name": "braillescan_ai",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

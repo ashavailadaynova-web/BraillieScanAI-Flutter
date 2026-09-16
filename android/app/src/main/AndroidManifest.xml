@@ -1,26 +1,8 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
-    <!-- BrailleScan AI: permission kamera, lampu kilat (flash), dan akses galeri -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.FLASHLIGHT" />
-    <!-- Akses media lama (API < 29) dan pembacaan penyimpanan bersama (API 29-32) -->
-    <uses-permission
-        android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32" />
-    <uses-permission
-        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="29"
-        tools:replace="android:maxSdkVersion" />
-
-    <uses-feature
-        android:name="android.hardware.camera.any"
-        android:required="true" />
-    <uses-feature
-        android:name="android.hardware.camera.flash"
-        android:required="false" />
-
+    <uses-feature android:name="android.hardware.camera" android:required="true" />
     <application
-        android:label="BrailleScan AI"
+        android:label="braillescan_ai"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
