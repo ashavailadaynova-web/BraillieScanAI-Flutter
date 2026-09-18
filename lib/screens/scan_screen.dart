@@ -1,15 +1,16 @@
 // ignore_for_file: avoid_print
-import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
+import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
-import 'package:path_provider/path_provider.dart';
+import 'package:image_cropper/image_cropper.dart';
+import 'package:image_picker/image_picker.dart';
 import '../services/braille_classifier.dart';
 
 class ScanScreen extends StatefulWidget {
   final List<CameraDescription> cameras;
+
   const ScanScreen({super.key, required this.cameras});
 
   @override
@@ -17,261 +18,192 @@ class ScanScreen extends StatefulWidget {
 }
 
 class _ScanScreenState extends State<ScanScreen> {
-  CameraController? _cameraController;
+  CameraController? _controller;
   final BrailleClassifier _classifier = BrailleClassifier();
-  bool _isCameraReady = false;
+  final ImagePicker _picker = ImagePicker();
   bool _isProcessing = false;
-  bool _isModelLoaded = false;
-  bool _invert = BrailleClassifier.invertColor;
-  int _orientation = BrailleClassifier.orientationCompensationDegrees;
-  String _errorMessage = '';
-  String scannedSentence = '';
-  Offset? _tapFocusPoint;
-  Timer? _focusTimer;
-
-  // Viewfinder persegi panjang horizontal khusus memindai baris Braille
-  static const double _viewfinderWidth = 340.0;
-  static const double _viewfinderHeight = 120.0;
-
-  final GlobalKey _previewAreaKey = GlobalKey();
+  bool _isTorchOn = false;
 
   @override
   void initState() {
     super.initState();
-    _setupCameraAndModel();
+    _initCameraAndModel();
   }
 
-  Future<void> _setupCameraAndModel() async {
-    await _setupCamera();
-    await _setupModel();
-  }
+  Future<void> _initCameraAndModel() async {
+    await _classifier.loadModel();
 
-  Future<void> _setupCamera() async {
-    if (widget.cameras.isEmpty) {
-      if (mounted) {
-        setState(
-          () => _errorMessage = 'Tidak ada sensor kamera yang terdeteksi.',
-        );
-      }
-      return;
-    }
-    _cameraController = CameraController(
-      widget.cameras[0],
-      ResolutionPreset.high,
+    if (widget.cameras.isEmpty) return;
+
+    _controller = CameraController(
+      widget.cameras.first,
+      ResolutionPreset.max,
       enableAudio: false,
     );
+
     try {
-      await _cameraController!.initialize();
-      final controller = _cameraController!;
-      try {
-        await controller.setExposureMode(ExposureMode.auto);
-      } catch (e) {
-        print("--> [WARN] Gagal set exposure auto: $e");
-      }
-      try {
-        await controller.setFocusMode(FocusMode.auto);
-      } catch (e) {
-        print("--> [WARN] Gagal set focus auto: $e");
-      }
-      if (mounted) {
-        setState(() => _isCameraReady = true);
-      }
+      await _controller!.initialize();
+
+      // Kompensasi pencahayaan negatif (-0.5 EV) agar kontur bayangan bintik tidak overexposure
+      final minExp = await _controller!.getMinExposureOffset();
+      final maxExp = await _controller!.getMaxExposureOffset();
+      final targetExp = (-0.5).clamp(minExp, maxExp);
+      await _controller!.setExposureOffset(targetExp);
+
+      if (mounted) setState(() {});
     } catch (e) {
-      print("--> [ERROR] Gagal mengakses kamera: $e");
-      if (mounted) {
-        setState(() => _errorMessage = 'Gagal mengakses kamera: $e');
-      }
+      print('Gagal inisialisasi kamera: $e');
     }
   }
 
-  Future<void> _setupModel() async {
+  Future<void> _toggleTorch() async {
+    if (_controller == null || !_controller!.value.isInitialized) return;
     try {
-      await _classifier.loadModel();
+      _isTorchOn = !_isTorchOn;
+      await _controller!.setFlashMode(
+        _isTorchOn ? FlashMode.torch : FlashMode.off,
+      );
+      setState(() {});
     } catch (e) {
-      print("--> [ERROR] Model PyTorch Lite gagal dimuat: $e");
+      print('Gagal menyalakan torch: $e');
+    }
+  }
+
+  // 1. Alur Jepret dari Kamera Langsung
+  Future<void> _captureAndCrop() async {
+    if (_controller == null ||
+        !_controller!.value.isInitialized ||
+        _isProcessing) {
+      return;
+    }
+
+    setState(() => _isProcessing = true);
+
+    try {
+      final XFile rawPhoto = await _controller!.takePicture();
+      await _openCropperAndProcess(rawPhoto.path);
+    } catch (e) {
+      print('Terjadi kesalahan saat memotret: $e');
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  // 2. Alur Ambil Foto dari Galeri
+  Future<void> _pickAndCropFromGallery() async {
+    if (_isProcessing) return;
+
+    try {
+      final XFile? pickedFile =
+          await _picker.pickImage(source: ImageSource.gallery);
+      if (pickedFile == null) return;
+
+      setState(() => _isProcessing = true);
+      await _openCropperAndProcess(pickedFile.path);
+    } catch (e) {
+      print('Terjadi kesalahan saat memilih galeri: $e');
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  // 3. Modul Pemotong Interaktif (Crop) & Eksekusi TFLite
+  Future<void> _openCropperAndProcess(String sourcePath) async {
+    try {
+      final CroppedFile? croppedFile = await ImageCropper().cropImage(
+        sourcePath: sourcePath,
+        uiSettings: [
+          AndroidUiSettings(
+            toolbarTitle: 'Pilih Baris Teks Braille',
+            toolbarColor: const Color(0xFF6750A4),
+            toolbarWidgetColor: Colors.white,
+            initAspectRatio: CropAspectRatioPreset.original,
+            lockAspectRatio: false,
+          ),
+          IOSUiSettings(
+            title: 'Pilih Baris Teks Braille',
+          ),
+        ],
+      );
+
+      if (croppedFile == null) {
+        if (mounted) setState(() => _isProcessing = false);
+        return;
+      }
+
+      final bytes = await File(croppedFile.path).readAsBytes();
+      final img.Image? croppedImage = img.decodeImage(bytes);
+
+      if (croppedImage == null) throw Exception('Gagal mendekode gambar crop.');
+
+      final result = await _classifier.predictDocument(croppedImage);
+
+      if (mounted) {
+        _showResultModal(result, croppedImage);
+      }
+    } catch (e) {
+      print('Terjadi kesalahan saat pemrosesan crop: $e');
     } finally {
-      if (mounted) {
-        setState(() => _isModelLoaded = _classifier.isLoaded);
-      }
+      if (mounted) setState(() => _isProcessing = false);
     }
   }
 
-  void _toggleInvert() {
-    BrailleClassifier.invertColor = !BrailleClassifier.invertColor;
-    setState(() => _invert = BrailleClassifier.invertColor);
-  }
+  Widget _buildAnnotatedImagePreview(
+      img.Image croppedImage, List<BrailleCellInfo> cells) {
+    final Uint8List jpgBytes = Uint8List.fromList(img.encodeJpg(croppedImage));
 
-  void _cycleOrientation() {
-    const List<int> options = <int>[-90, 0, 90, 180];
-    final int next =
-        options[(options.indexOf(_orientation) + 1) % options.length];
-    BrailleClassifier.orientationCompensationDegrees = next;
-    setState(() => _orientation = next);
-  }
-
-  void _appendScan(String chars) {
-    if (!mounted) return;
-    setState(() => scannedSentence += chars);
-  }
-
-  void _backspaceScan() {
-    if (scannedSentence.isEmpty || !mounted) return;
-    setState(
-      () => scannedSentence = scannedSentence.substring(
-        0,
-        scannedSentence.length - 1,
+    return Container(
+      width: double.infinity,
+      height: 160,
+      decoration: BoxDecoration(
+        color: Colors.black87,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.grey.shade300),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: FittedBox(
+          fit: BoxFit.contain,
+          child: SizedBox(
+            width: croppedImage.width.toDouble(),
+            height: croppedImage.height.toDouble(),
+            child: Stack(
+              children: [
+                Image.memory(jpgBytes),
+                CustomPaint(
+                  size: Size(
+                    croppedImage.width.toDouble(),
+                    croppedImage.height.toDouble(),
+                  ),
+                  painter: _BrailleBoxesPainter(cells),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
 
-  void _clearScan() {
-    if (!mounted) return;
-    setState(() => scannedSentence = '');
-  }
-
-  void _handlePreviewTap(TapDownDetails details) {
-    final controller = _cameraController;
-    if (controller == null || !controller.value.isInitialized) return;
-    final screenSize = MediaQuery.sizeOf(context);
-    final focusPoint = Offset(
-      details.localPosition.dx / screenSize.width,
-      details.localPosition.dy / screenSize.height,
-    );
-    controller.setFocusMode(FocusMode.auto);
-    controller.setFocusPoint(focusPoint);
-    _focusTimer?.cancel();
-    setState(() => _tapFocusPoint = details.localPosition);
-    _focusTimer = Timer(const Duration(milliseconds: 1200), () {
-      if (mounted) {
-        setState(() => _tapFocusPoint = null);
-      }
-    });
-  }
-
-  Future<void> _captureAndScan() async {
-    if (!_isCameraReady || _cameraController == null || _isProcessing) {
-      return;
-    }
-    if (!_classifier.isLoaded) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text("Model AI belum siap. Memuat ulang..."),
-            backgroundColor: Colors.orange,
-          ),
-        );
-      }
-      await _classifier.loadModel();
-      if (mounted) {
-        setState(() => _isModelLoaded = _classifier.isLoaded);
-      }
-      return;
-    }
-    setState(() => _isProcessing = true);
-    final Size previewAreaSize = _previewAreaSize();
-    try {
-      await _cameraController!.setFocusMode(FocusMode.auto);
-      await Future.delayed(const Duration(milliseconds: 300));
-      final XFile photo = await _cameraController!.takePicture();
-      final bytes = await File(photo.path).readAsBytes();
-      final img.Image? originalImage = img.decodeImage(bytes);
-      if (originalImage == null) {
-        throw Exception('Gagal decode gambar');
-      }
-
-      // Potong tepat pada kotak panjang viewfinder
-      final img.Image scanImage = _cropToViewfinder(
-        originalImage,
-        previewAreaSize,
-      );
-
-      final tempDir = await getTemporaryDirectory();
-      final File savedCroppedFile = File(
-        '${tempDir.path}/crop_line_${DateTime.now().millisecondsSinceEpoch}.jpg',
-      );
-      await savedCroppedFile.writeAsBytes(img.encodeJpg(scanImage), flush: true);
-
-      // Jalankan deteksi baris & Bounding Box
-      final result = await _classifier.predictDocument(scanImage);
-      _showDocumentResultDialog(result, savedCroppedFile, scanImage);
-    } catch (e, stackTrace) {
-      print('--> [ERROR INFERENCE SCAN]: $e');
-      print('--> [STACK TRACE]: $stackTrace');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Scan gagal: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _isProcessing = false);
-      }
-    }
-  }
-
-  Size _previewAreaSize() {
-    final RenderBox? box =
-        _previewAreaKey.currentContext?.findRenderObject() as RenderBox?;
-    if (box != null && box.hasSize && box.size.width > 0) {
-      return box.size;
-    }
-    return MediaQuery.sizeOf(context);
-  }
-
-  img.Image _cropToViewfinder(img.Image original, Size previewAreaSize) {
-    final double scale = math.max(
-      original.width / previewAreaSize.width,
-      original.height / previewAreaSize.height,
-    );
-
-    final double left = (previewAreaSize.width - _viewfinderWidth) / 2.0;
-    final double top = (previewAreaSize.height - _viewfinderHeight) / 2.0;
-
-    final int cropX = (left * scale).round().clamp(0, original.width - 1);
-    final int cropY = (top * scale).round().clamp(0, original.height - 1);
-    final int cropW =
-        (_viewfinderWidth * scale).round().clamp(1, original.width - cropX);
-    final int cropH =
-        (_viewfinderHeight * scale).round().clamp(1, original.height - cropY);
-
-    return img.copyCrop(
-      original,
-      x: cropX,
-      y: cropY,
-      width: cropW,
-      height: cropH,
-    );
-  }
-
-  void _showDocumentResultDialog(
-    Map<String, dynamic> result,
-    File croppedImageFile,
-    img.Image croppedImage,
-  ) {
-    imageCache.clear();
-    imageCache.clearLiveImages();
-    final String fullText = (result['text'] ?? '').toString();
-    final List<BrailleCellInfo> cells =
-        (result['cells'] as List<BrailleCellInfo>?) ?? [];
-
-    showModalBottomSheet<void>(
+  void _showResultModal(Map<String, dynamic> result, img.Image croppedImage) {
+    showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
+      backgroundColor: Colors.transparent,
       builder: (context) {
+        final String recognizedText = (result['text'] ?? '').toString();
+        final List<BrailleCellInfo> cells =
+            (result['cells'] as List<BrailleCellInfo>?) ?? [];
+
         return DraggableScrollableSheet(
           initialChildSize: 0.85,
           minChildSize: 0.5,
           maxChildSize: 0.95,
-          expand: false,
-          builder: (context, scrollController) {
-            return Padding(
-              padding: const EdgeInsets.all(20.0),
+          builder: (_, scrollController) {
+            return Container(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+              decoration: const BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+              ),
               child: ListView(
                 controller: scrollController,
                 children: [
@@ -279,136 +211,105 @@ class _ScanScreenState extends State<ScanScreen> {
                     child: Container(
                       width: 40,
                       height: 4,
+                      margin: const EdgeInsets.only(bottom: 12),
                       decoration: BoxDecoration(
                         color: Colors.grey[300],
                         borderRadius: BorderRadius.circular(2),
                       ),
                     ),
                   ),
-                  const SizedBox(height: 12),
-                  Text(
-                    'Hasil Pemindaian Baris',
-                    style: Theme.of(context).textTheme.titleLarge,
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 16),
-
-                  // Foto Kotak Hasil Scan dengan Bounding Box Hijau & Bulatan Sudut
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(12),
-                    child: Container(
-                      color: Colors.black,
-                      child: AspectRatio(
-                        aspectRatio: croppedImage.width / croppedImage.height,
-                        child: CustomPaint(
-                          foregroundPainter: BoundingBoxPainter(
-                            cells: cells,
-                            originalImageSize: Size(
-                              croppedImage.width.toDouble(),
-                              croppedImage.height.toDouble(),
-                            ),
-                          ),
-                          child: Image.file(
-                            croppedImageFile,
-                            key: UniqueKey(),
-                            fit: BoxFit.contain,
-                          ),
-                        ),
-                      ),
+                  const Center(
+                    child: Text(
+                      'Hasil Pemindaian Baris',
+                      style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                     ),
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 14),
 
-                  // Teks Terbaca
+                  _buildAnnotatedImagePreview(croppedImage, cells),
+                  const SizedBox(height: 14),
+
                   Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      color: Colors.grey.shade100,
+                      color: Colors.grey[100],
                       borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.grey.shade300),
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text(
+                        Text(
                           'Teks Braille Terbaca:',
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.grey,
-                          ),
+                          style: TextStyle(fontSize: 12, color: Colors.grey[600]),
                         ),
                         const SizedBox(height: 6),
                         SelectableText(
-                          fullText.isEmpty ? '(Tidak ada huruf terdeteksi)' : fullText,
+                          recognizedText.isEmpty
+                              ? '(Tidak terdeteksi)'
+                              : recognizedText,
                           style: const TextStyle(
-                            fontSize: 26,
+                            fontSize: 22,
                             fontWeight: FontWeight.bold,
-                            color: Colors.deepPurple,
-                            letterSpacing: 2.0,
+                            color: Color(0xFF5B458E),
+                            letterSpacing: 1.5,
                           ),
                         ),
                       ],
                     ),
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 16),
 
-                  // Galeri Tiap Sel
                   if (cells.isNotEmpty) ...[
-                    const Text(
-                      'Inspeksi Sel:',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.grey,
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        'Inspeksi Sel (${cells.length} sel):',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.grey[700],
+                        ),
                       ),
                     ),
                     const SizedBox(height: 8),
                     SizedBox(
-                      height: 95,
-                      child: ListView.builder(
+                      height: 90,
+                      child: ListView.separated(
                         scrollDirection: Axis.horizontal,
                         itemCount: cells.length,
-                        itemBuilder: (context, index) {
-                          final cell = cells[index];
-                          final file = File(cell.imagePath);
-                          return Padding(
-                            padding: const EdgeInsets.only(right: 8.0),
+                        separatorBuilder: (_, __) => const SizedBox(width: 8),
+                        itemBuilder: (context, idx) {
+                          final cell = cells[idx];
+                          return Container(
+                            width: 65,
+                            decoration: BoxDecoration(
+                              border: Border.all(
+                                color: Colors.green,
+                                width: 1.5,
+                              ),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
                             child: Column(
-                              mainAxisSize: MainAxisSize.min,
+                              mainAxisAlignment: MainAxisAlignment.center,
                               children: [
-                                Container(
-                                  padding: const EdgeInsets.all(2),
-                                  decoration: BoxDecoration(
-                                    color: Colors.white,
-                                    borderRadius: BorderRadius.circular(6),
-                                    border: Border.all(
-                                      color: Colors.greenAccent.shade700,
-                                      width: 1.5,
-                                    ),
-                                  ),
-                                  child: file.existsSync()
-                                      ? Image.file(
-                                          file,
-                                          key: UniqueKey(),
-                                          width: 50,
-                                          height: 50,
-                                          fit: BoxFit.contain,
-                                        )
-                                      : const SizedBox(
-                                          width: 50,
-                                          height: 50,
-                                          child: Icon(Icons.broken_image, size: 20),
-                                        ),
-                                ),
+                                if (cell.imagePath.isNotEmpty &&
+                                    File(cell.imagePath).existsSync())
+                                  Image.file(
+                                    File(cell.imagePath),
+                                    width: 36,
+                                    height: 36,
+                                    fit: BoxFit.contain,
+                                  )
+                                else
+                                  const Icon(Icons.crop_square, size: 30),
                                 const SizedBox(height: 4),
                                 Text(
                                   cell.label,
                                   style: const TextStyle(
-                                    fontSize: 16,
                                     fontWeight: FontWeight.bold,
-                                    color: Colors.deepPurple,
+                                    fontSize: 16,
+                                    color: Color(0xFF5B458E),
                                   ),
                                 ),
                               ],
@@ -418,24 +319,26 @@ class _ScanScreenState extends State<ScanScreen> {
                       ),
                     ),
                   ],
+                  const SizedBox(height: 20),
 
-                  const SizedBox(height: 16),
-                  FilledButton.icon(
-                    onPressed: () {
-                      if (fullText.isNotEmpty) {
-                        _appendScan(
-                          scannedSentence.isEmpty ? fullText : ' $fullText',
-                        );
-                      }
-                      Navigator.pop(context);
-                    },
-                    icon: const Icon(Icons.add),
-                    label: const Text('Tambahkan ke Kalimat Utama'),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF6750A4),
+                      minimumSize: const Size(double.infinity, 50),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(25),
+                      ),
+                    ),
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text(
+                      '+ Tambahkan ke Kalimat Utama',
+                      style: TextStyle(color: Colors.white, fontSize: 16),
+                    ),
                   ),
                   const SizedBox(height: 8),
                   TextButton(
                     onPressed: () => Navigator.pop(context),
-                    child: const Text('Tutup'),
+                    child: const Text('Tutup', style: TextStyle(color: Colors.grey)),
                   ),
                 ],
               ),
@@ -448,277 +351,119 @@ class _ScanScreenState extends State<ScanScreen> {
 
   @override
   void dispose() {
-    _cameraController?.dispose();
+    _controller?.dispose();
     _classifier.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_errorMessage.isNotEmpty) {
-      return Scaffold(
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(20.0),
-            child: Text(
-              _errorMessage,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.red, fontSize: 16),
-            ),
-          ),
-        ),
-      );
-    }
-    if (!_isCameraReady || _cameraController == null) {
+    if (_controller == null || !_controller!.value.isInitialized) {
       return const Scaffold(
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              CircularProgressIndicator(),
-              SizedBox(height: 16),
-              Text('Menyiapkan kamera & model AI...'),
-            ],
-          ),
-        ),
+        backgroundColor: Colors.black,
+        body: Center(child: CircularProgressIndicator(color: Colors.white)),
       );
     }
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('BrailleScan AI'),
-      ),
+      backgroundColor: Colors.black,
       body: Stack(
-        alignment: Alignment.center,
         children: [
-          SizedBox.expand(
-            key: _previewAreaKey,
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTapDown: _handlePreviewTap,
-              child: FittedBox(
-                fit: BoxFit.cover,
-                child: SizedBox(
-                  width: _cameraController!.value.previewSize?.height ?? 1080,
-                  height: _cameraController!.value.previewSize?.width ?? 1920,
-                  child: CameraPreview(_cameraController!),
-                ),
-              ),
-            ),
-          ),
-          if (_tapFocusPoint != null)
-            Positioned(
-              left: _tapFocusPoint!.dx - 28,
-              top: _tapFocusPoint!.dy - 28,
-              child: Container(
-                width: 56,
-                height: 56,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 2),
-                ),
-              ),
-            ),
-
-          // Viewfinder Persegi Panjang untuk Baris Braille
-          Container(
-            width: _viewfinderWidth,
-            height: _viewfinderHeight,
-            decoration: BoxDecoration(
-              border: Border.all(color: Colors.yellowAccent, width: 2.5),
-              borderRadius: BorderRadius.circular(12),
-              color: Colors.black.withValues(alpha: 0.1),
-            ),
-          ),
+          Positioned.fill(child: CameraPreview(_controller!)),
 
           Positioned(
-            top: 24,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              decoration: BoxDecoration(
-                color: Colors.black87,
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: const Text(
-                'Arahkan baris teks Braille ke dalam kotak kuning',
-                style: TextStyle(color: Colors.white, fontSize: 13),
-              ),
-            ),
-          ),
-          Positioned(
-            top: 68,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-              decoration: BoxDecoration(
-                color: _isModelLoaded
-                    ? Colors.green.withValues(alpha: 0.85)
-                    : Colors.orange.shade800,
-                borderRadius: BorderRadius.circular(14),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    _isModelLoaded ? Icons.check_circle : Icons.hourglass_top,
+            top: 45,
+            left: 16,
+            right: 16,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.arrow_back_ios, color: Colors.white),
+                  onPressed: () => Navigator.pop(context),
+                ),
+                const Text(
+                  'BrailleScan AI',
+                  style: TextStyle(
                     color: Colors.white,
-                    size: 16,
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
                   ),
-                  const SizedBox(width: 6),
-                  Text(
-                    _isModelLoaded ? 'AI Siap' : 'Memuat Model AI...',
-                    style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
+                IconButton(
+                  icon: Icon(
+                    _isTorchOn ? Icons.flash_on : Icons.flash_off,
+                    color: _isTorchOn ? Colors.amberAccent : Colors.white,
                   ),
+                  tooltip: 'Pencahayaan Senter',
+                  onPressed: _toggleTorch,
+                ),
+              ],
+            ),
+          ),
+
+          Positioned(
+            bottom: 140,
+            left: 20,
+            right: 20,
+            child: Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.65),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Text(
+                  'Jepret atau pilih gambar, lalu potong 1-2 baris',
+                  style: TextStyle(color: Colors.white, fontSize: 13),
+                ),
+              ),
+            ),
+          ),
+
+          // Kontrol Bar Bawah (Galeri di kiri, Shutter Kamera di tengah)
+          Positioned(
+            bottom: 40,
+            left: 0,
+            right: 0,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 40),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  // Tombol Import Galeri
+                  IconButton(
+                    icon: const Icon(Icons.photo_library,
+                        color: Colors.white, size: 36),
+                    tooltip: 'Pilih dari Galeri',
+                    onPressed: _isProcessing ? null : _pickAndCropFromGallery,
+                  ),
+
+                  // Tombol Shutter Kamera
+                  _isProcessing
+                      ? const CircularProgressIndicator(color: Colors.white)
+                      : GestureDetector(
+                          onTap: _captureAndCrop,
+                          child: Container(
+                            width: 78,
+                            height: 78,
+                            padding: const EdgeInsets.all(4),
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              border: Border.all(color: Colors.white, width: 4),
+                            ),
+                            child: Container(
+                              decoration: const BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
+
+                  // Penyeimbang layout
+                  const SizedBox(width: 48),
                 ],
-              ),
-            ),
-          ),
-          Positioned(
-            left: 16,
-            top: 100,
-            child: Material(
-              color: _invert ? Colors.blueGrey.shade800 : Colors.black87,
-              borderRadius: BorderRadius.circular(20),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(20),
-                onTap: _toggleInvert,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(
-                        Icons.invert_colors,
-                        color: Colors.white,
-                        size: 16,
-                      ),
-                      const SizedBox(width: 6),
-                      Text(
-                        _invert ? 'Invert: ON' : 'Invert B/W',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-          Positioned(
-            left: 16,
-            top: 140,
-            child: Material(
-              color: _orientation == -90
-                  ? Colors.blueGrey.shade800
-                  : Colors.black87,
-              borderRadius: BorderRadius.circular(20),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(20),
-                onTap: _cycleOrientation,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(
-                        Icons.rotate_90_degrees_ccw,
-                        color: Colors.white,
-                        size: 16,
-                      ),
-                      const SizedBox(width: 6),
-                      Text(
-                        'Rotasi: $_orientation°',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-          Positioned(
-            bottom: 36,
-            child: FloatingActionButton.large(
-              onPressed: _isProcessing ? null : _captureAndScan,
-              child: _isProcessing
-                  ? const CircularProgressIndicator(color: Colors.white)
-                  : const Icon(Icons.camera_alt, size: 36),
-            ),
-          ),
-          Positioned(
-            left: 12,
-            right: 12,
-            bottom: 150,
-            child: Material(
-              color: Colors.black87,
-              borderRadius: BorderRadius.circular(16),
-              elevation: 6,
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Text(
-                          'Kalimat:',
-                          style: TextStyle(
-                            color: Colors.white70,
-                            fontSize: 12,
-                          ),
-                        ),
-                        const Spacer(),
-                        IconButton(
-                          onPressed: scannedSentence.isEmpty
-                              ? null
-                              : _backspaceScan,
-                          icon: const Icon(Icons.backspace_outlined),
-                          color: Colors.white,
-                          iconSize: 20,
-                          tooltip: 'Hapus huruf terakhir',
-                          constraints: const BoxConstraints(),
-                          padding: const EdgeInsets.all(6),
-                        ),
-                        IconButton(
-                          onPressed: scannedSentence.isEmpty
-                              ? null
-                              : _clearScan,
-                          icon: const Icon(Icons.clear_all),
-                          color: Colors.white,
-                          iconSize: 20,
-                          tooltip: 'Bersihkan kalimat',
-                          constraints: const BoxConstraints(),
-                          padding: const EdgeInsets.all(6),
-                        ),
-                      ],
-                    ),
-                    ConstrainedBox(
-                      constraints: const BoxConstraints(maxHeight: 96),
-                      child: SingleChildScrollView(
-                        child: Text(
-                          scannedSentence.isEmpty
-                              ? '(kosong - arahkan baris kata ke kotak kuning)'
-                              : scannedSentence,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 18,
-                            height: 1.3,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
               ),
             ),
           ),
@@ -728,72 +473,43 @@ class _ScanScreenState extends State<ScanScreen> {
   }
 }
 
-class BoundingBoxPainter extends CustomPainter {
+class _BrailleBoxesPainter extends CustomPainter {
   final List<BrailleCellInfo> cells;
-  final Size originalImageSize;
 
-  BoundingBoxPainter({
-    required this.cells,
-    required this.originalImageSize,
-  });
+  _BrailleBoxesPainter(this.cells);
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (originalImageSize.width == 0 || originalImageSize.height == 0) return;
-
-    final double scaleX = size.width / originalImageSize.width;
-    final double scaleY = size.height / originalImageSize.height;
-
-    final Paint boxPaint = Paint()
-      ..color = const Color(0xFF00E676)
+    final boxPaint = Paint()
+      ..color = const Color(0xFF00FF66)
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.4;
-
-    final Paint cornerDotPaint = Paint()
-      ..color = const Color(0xFF00E676)
-      ..style = PaintingStyle.fill;
-
-    const double cornerRadius = 2.5;
-
-    final textStyle = const TextStyle(
-      color: Color(0xFF00E676),
-      fontSize: 11,
-      fontWeight: FontWeight.bold,
-    );
+      ..strokeWidth = 2.5;
 
     for (final cell in cells) {
-      final rect = Rect.fromLTRB(
-        cell.boundingBox.left * scaleX,
-        cell.boundingBox.top * scaleY,
-        cell.boundingBox.right * scaleX,
-        cell.boundingBox.bottom * scaleY,
+      canvas.drawRect(cell.boundingBox, boxPaint);
+
+      final textSpan = TextSpan(
+        text: cell.label,
+        style: const TextStyle(
+          color: Color(0xFF00FF66),
+          fontSize: 16,
+          fontWeight: FontWeight.bold,
+          backgroundColor: Colors.black87,
+        ),
       );
 
-      // 1. Gambar Garis Kotak Sel
-      canvas.drawRect(rect, boxPaint);
+      final textPainter = TextPainter(
+        text: textSpan,
+        textDirection: TextDirection.ltr,
+      )..layout();
 
-      // 2. Gambar 4 Bulatan Titik di Sudut Kotak
-      canvas.drawCircle(rect.topLeft, cornerRadius, cornerDotPaint);
-      canvas.drawCircle(rect.topRight, cornerRadius, cornerDotPaint);
-      canvas.drawCircle(rect.bottomLeft, cornerRadius, cornerDotPaint);
-      canvas.drawCircle(rect.bottomRight, cornerRadius, cornerDotPaint);
+      final double posX = cell.boundingBox.left +
+          (cell.boundingBox.width - textPainter.width) / 2;
+      final double posY = (cell.boundingBox.top - textPainter.height - 2) < 0
+          ? cell.boundingBox.top + 2
+          : cell.boundingBox.top - textPainter.height - 2;
 
-      // 3. Tampilkan Karakter Huruf Kecil Tepat di Atas Kotak Sel
-      if (cell.label.isNotEmpty && cell.label != '?' && cell.label != ' ') {
-        final textSpan = TextSpan(
-          text: cell.label.toLowerCase(),
-          style: textStyle,
-        );
-        final textPainter = TextPainter(
-          text: textSpan,
-          textDirection: TextDirection.ltr,
-        )..layout();
-
-        final double textX = rect.left + (rect.width - textPainter.width) / 2.0;
-        final double textY = rect.top - textPainter.height - 1;
-
-        textPainter.paint(canvas, Offset(textX, math.max(0, textY)));
-      }
+      textPainter.paint(canvas, Offset(posX, posY));
     }
   }
 

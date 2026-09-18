@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
-import 'package:pytorch_lite/pytorch_lite.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
 
 /// Informasi satu sel Braille hasil deteksi, lengkap dengan Bounding Box pada citra asli.
 class BrailleCellInfo {
@@ -23,42 +23,42 @@ class BrailleCellInfo {
   });
 }
 
+/// Alias kompatibilitas unit test
+class BrailleCell {
+  final List<_Blob> blobs;
+  BrailleCell(this.blobs);
+  int get dotCount => blobs.length;
+}
+
 class BrailleClassifier {
   static bool invertColor = false;
-  static int orientationCompensationDegrees = -90;
-  static const String _modelPath = 'assets/models/braille_model.ptl';
+  static int orientationCompensationDegrees = 0;
+  static const String _modelPath = 'assets/models/braille_model.tflite';
+  static const String _labelsPath = 'assets/models/labels.txt';
   static const int inputSize = 28;
 
-  static const List<double> _normMean = [0.0, 0.0, 0.0];
-  static const List<double> _normStd = [1.0, 1.0, 1.0];
-
-  ClassificationModel? _pytorchModel;
+  Interpreter? _interpreter;
   List<String> _labels = [];
   bool _isModelLoaded = false;
   bool get isLoaded => _isModelLoaded;
 
   Future<void> loadModel() async {
     try {
-      print("--> [DEBUG] Memuat PyTorch model & labels.txt...");
-      final ByteData modelBytes = await rootBundle.load(_modelPath);
-      if (modelBytes.lengthInBytes < 4 * 1024) {
-        throw Exception(
-          'File model $_modelPath terlalu kecil (${modelBytes.lengthInBytes} bytes).',
-        );
-      }
+      print("--> [DEBUG] Memuat TensorFlow Lite Model...");
+      _interpreter = await Interpreter.fromAsset(_modelPath);
 
-      _pytorchModel = await PytorchLite.loadClassificationModel(
-        _modelPath,
-        28,
-        28,
-        labelPath: 'assets/models/labels.txt',
-      );
-      _labels = List<String>.from(_pytorchModel!.labels);
+      final String labelData = await rootBundle.loadString(_labelsPath);
+      _labels = labelData
+          .split('\n')
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty)
+          .toList();
+
       _isModelLoaded = true;
-      print("--> [SUCCESS] PyTorch Model berhasil aktif!");
+      print("--> [SUCCESS] TFLite Model aktif! Total label: ${_labels.length}");
     } catch (e, stackTrace) {
       _isModelLoaded = false;
-      print("--> [ERROR LOAD MODEL]: $e");
+      print("--> [ERROR LOAD TFLITE MODEL]: $e");
       print("--> [STACK TRACE]: $stackTrace");
     }
   }
@@ -69,17 +69,41 @@ class BrailleClassifier {
     return img.copyRotate(image, angle: angle);
   }
 
+  /// Penajaman kontras lokal sebelum proses morfologi
+  img.Image _enhanceLocalContrast(img.Image gray) {
+    int minVal = 255;
+    int maxVal = 0;
+
+    for (final pixel in gray) {
+      final lum = img.getLuminance(pixel).round();
+      if (lum < minVal) minVal = lum;
+      if (lum > maxVal) maxVal = lum;
+    }
+
+    final range = maxVal - minVal;
+    if (range <= 15) return gray;
+
+    final img.Image out = img.Image(width: gray.width, height: gray.height);
+    for (final pixel in gray) {
+      final lum = img.getLuminance(pixel).round();
+      final stretched = ((lum - minVal) * 255 / range).round().clamp(0, 255);
+      out.setPixelRgb(pixel.x, pixel.y, stretched, stretched, stretched);
+    }
+    return out;
+  }
+
   img.Image preprocessed(img.Image imageInput, {bool invert = false}) {
     final img.Image gray = img.grayscale(imageInput);
     final img.Image grayW = _workingScale(gray);
-    final img.Image blackHat = _blackHatMorphology(grayW);
+    final img.Image enhanced = _enhanceLocalContrast(grayW);
+    final img.Image blackHat = _blackHatMorphology(enhanced);
     final img.Image binaryHat = _binarizeOtsu(img.invert(blackHat));
     List<_Blob> blobs = _connectedBlackComponents(binaryHat);
     img.Image cell;
     if (blobs.isNotEmpty) {
       cell = _gridToCanvas(_blobsToGrid(blobs));
     } else {
-      final img.Image binaryGray = _binarizeOtsu(grayW);
+      final img.Image binaryGray = _binarizeOtsu(enhanced);
       blobs = _connectedBlackComponents(binaryGray);
       if (blobs.isNotEmpty) {
         cell = _gridToCanvas(_blobsToGrid(blobs));
@@ -98,7 +122,7 @@ class BrailleClassifier {
   }
 
   img.Image _workingScale(img.Image gray) {
-    const int targetH = 210;
+    const int targetH = 400;
     if (gray.height == targetH) return gray;
     final int w = math.max(1, (gray.width * targetH / gray.height).round());
     return img.copyResize(
@@ -121,7 +145,7 @@ class BrailleClassifier {
   }
 
   img.Image _blackHatMorphology(img.Image gray) {
-    final int radius = (gray.height * 0.05).round().clamp(3, 12);
+    final int radius = (gray.height * 0.03).round().clamp(3, 10);
     final List<(int, int)> kernel = _ellipseKernelList(radius);
     final img.Image closed = _morphErode(_morphDilate(gray, kernel), kernel);
     final img.Image out = img.Image(width: gray.width, height: gray.height);
@@ -129,7 +153,10 @@ class BrailleClassifier {
       for (int x = 0; x < gray.width; x++) {
         final int closedLum = img.getLuminance(closed.getPixel(x, y)).round();
         final int grayLum = img.getLuminance(gray.getPixel(x, y)).round();
-        final int diff = math.min(255, math.max(0, closedLum - grayLum));
+        final int diff = math.min(
+          255,
+          math.max(0, ((closedLum - grayLum) * 1.35).round()),
+        );
         out.setPixelRgb(x, y, diff, diff, diff);
       }
     }
@@ -181,7 +208,7 @@ class BrailleClassifier {
       (1, 0),
       (-1, 0),
     ];
-    const int minArea = 2; // Dilonggarkan agar titik tipis terangkat
+    const int minArea = 2;
     final int w = binary.width;
     final int h = binary.height;
     final Uint8List visited = Uint8List(w * h);
@@ -248,8 +275,6 @@ class BrailleClassifier {
     final List<_Blob> kept = _filterBlobs(blobs);
     if (kept.isEmpty) return grid;
 
-    // KASUS KHUSUS 1 TITIK (misalnya huruf A):
-    // Jika hanya ada 1 titik dalam sel, Braille standar selalu menempatkannya di Dot 1 (kiri atas).
     if (kept.length == 1) {
       grid[0][0] = true;
       return grid;
@@ -276,11 +301,11 @@ class BrailleClassifier {
 
     final double spanX = maxX - minX;
     final double spanY = maxY - minY;
-    final bool twoColumns = spanX >= 16;
+    final bool twoColumns = spanX >= 12;
     final double midX = (minX + maxX) / 2.0;
 
     final double rowPitch = spanY > 10
-        ? math.max(1.0, spanY / (spanY > 35 ? 2.0 : 1.0))
+        ? math.max(1.0, spanY / (spanY > 28 ? 2.0 : 1.0))
         : (twoColumns
             ? math.max(1.0, spanX - dotWidth)
             : math.max(1.0, dotHeight * 1.6));
@@ -315,7 +340,7 @@ class BrailleClassifier {
       final double longSide = math.max(w, h);
       if (b.area < 2 || b.area < 0.15 * medArea) continue;
       if (b.area > 6.0 * medArea) continue;
-      if (shortSide < 0.3 * longSide) continue;
+      if (shortSide < 0.25 * longSide) continue;
       if (longSide > 3.0 * medHeight) continue;
       kept.add(b);
     }
@@ -330,19 +355,59 @@ class BrailleClassifier {
     return (sorted[mid - 1] + sorted[mid]) / 2.0;
   }
 
-  List<_Blob> _detectBlobs(img.Image imageInput) {
+  List<_Blob> detectBlobs(img.Image imageInput) {
     final img.Image gray = img.grayscale(imageInput);
     final img.Image grayW = _workingScale(gray);
-    final img.Image blackHat = _blackHatMorphology(grayW);
+    final img.Image enhanced = _enhanceLocalContrast(grayW);
+    final img.Image blackHat = _blackHatMorphology(enhanced);
     final img.Image binaryHat = _binarizeOtsu(img.invert(blackHat));
     List<_Blob> blobs = _connectedBlackComponents(binaryHat);
     if (blobs.isEmpty) {
-      blobs = _connectedBlackComponents(_binarizeOtsu(grayW));
+      blobs = _connectedBlackComponents(_binarizeOtsu(enhanced));
     }
     return _filterBlobs(blobs);
   }
 
-  List<List<_Blob>> _clusterCells(List<_Blob> blobs) {
+  /// Segmentasi Multi-Baris Dinamis: Menjaga 1 sel Braille utuh dan hanya memotong saat jeda antar-baris nyata
+  List<List<_Blob>> splitIntoLines(List<_Blob> blobs) {
+    if (blobs.isEmpty) return [];
+
+    final List<_Blob> byY = List<_Blob>.from(blobs)
+      ..sort((a, b) => a.cy.compareTo(b.cy));
+
+    final double dotHeight = _median(
+      byY.map((b) => (b.maxY - b.minY).toDouble()).toList(),
+    );
+
+    // 1 baris Braille tingginya ~3x dotHeight. Jeda batas baris baru harus di atas 2x dotHeight
+    final double lineBreakGap = math.max(18.0, dotHeight * 2.1);
+
+    final List<List<_Blob>> lines = [];
+    List<_Blob> currentLine = [byY.first];
+    double currentLineBottom = byY.first.maxY.toDouble();
+
+    for (int i = 1; i < byY.length; i++) {
+      final _Blob b = byY[i];
+
+      if ((b.cy - currentLineBottom) > lineBreakGap) {
+        lines.add(currentLine);
+        currentLine = [b];
+        currentLineBottom = b.maxY.toDouble();
+      } else {
+        currentLine.add(b);
+        if (b.maxY > currentLineBottom) {
+          currentLineBottom = b.maxY.toDouble();
+        }
+      }
+    }
+    lines.add(currentLine);
+
+    final validLines = lines.where((l) => l.length >= 3).toList();
+    return validLines.isNotEmpty ? validLines : [blobs];
+  }
+
+  /// Klasterisasi horizontal sel Braille per baris (Presisi teruji tanpa memecah huruf)
+  List<List<_Blob>> clusterCells(List<_Blob> blobs) {
     if (blobs.isEmpty) return <List<_Blob>>[];
 
     final List<_Blob> byX = List<_Blob>.from(blobs)
@@ -405,6 +470,17 @@ class BrailleClassifier {
         cell.map((b) => b.minX.toDouble()).reduce(math.min);
     cells.sort((a, b) => minXOf(a).compareTo(minXOf(b)));
     return cells;
+  }
+
+  List<BrailleCell> segmentCellsForTest(img.Image image) {
+    final blobs = detectBlobs(image);
+    final lines = splitIntoLines(blobs);
+    final List<BrailleCell> allCells = [];
+    for (final line in lines) {
+      final clusters = clusterCells(line);
+      allCells.addAll(clusters.map((c) => BrailleCell(c)));
+    }
+    return allCells;
   }
 
   img.Image _gridToCanvas(List<List<bool>> grid) {
@@ -501,8 +577,8 @@ class BrailleClassifier {
     bool cleanPattern = false,
     String fileSuffix = '',
   }) async {
-    if (!isLoaded) {
-      throw Exception('Model belum siap dipakai.');
+    if (!isLoaded || _interpreter == null) {
+      throw Exception('Model TFLite belum siap dipakai.');
     }
     final img.Image resized = cleanPattern
         ? img.copyResize(
@@ -517,55 +593,75 @@ class BrailleClassifier {
 
     final Directory tempDir = await getTemporaryDirectory();
     final String suffix = fileSuffix.isNotEmpty ? '_$fileSuffix' : '';
-    final File debugFile = File('${tempDir.path}/debug_input_28x28$suffix.png');
-    await debugFile.writeAsBytes(img.encodePng(oriented), flush: true);
+    final File previewFile =
+        File('${tempDir.path}/debug_view_28x28$suffix.png');
+    await previewFile.writeAsBytes(img.encodePng(oriented), flush: true);
 
-    final img.Image pluginView = img.copyRotate(oriented, angle: 90);
-    final File pluginFile =
-        File('${tempDir.path}/debug_plugin_view_28x28$suffix.png');
-    await pluginFile.writeAsBytes(img.encodePng(pluginView), flush: true);
+    final inputShape = _interpreter!.getInputTensor(0).shape;
+    final isGrayscale = inputShape.length == 4 && inputShape[3] == 1;
 
-    final Uint8List imageBytes = await debugFile.readAsBytes();
+    dynamic inputTensor;
+    if (isGrayscale) {
+      inputTensor = List.generate(
+        1,
+        (_) => List.generate(
+          inputSize,
+          (y) => List.generate(
+            inputSize,
+            (x) {
+              final lum = img.getLuminance(oriented.getPixel(x, y));
+              return [lum / 255.0];
+            },
+          ),
+        ),
+      );
+    } else {
+      inputTensor = List.generate(
+        1,
+        (_) => List.generate(
+          inputSize,
+          (y) => List.generate(
+            inputSize,
+            (x) {
+              final p = oriented.getPixel(x, y);
+              return [p.r / 255.0, p.g / 255.0, p.b / 255.0];
+            },
+          ),
+        ),
+      );
+    }
+
+    final outputShape = _interpreter!.getOutputTensor(0).shape;
+    final outputNumClasses = outputShape[1];
+    final outputTensor = [List<double>.filled(outputNumClasses, 0.0)];
+
     final stopwatch = Stopwatch()..start();
-    String prediction;
-    List<double?>? probabilities;
     try {
-      prediction = await _pytorchModel!.getImagePrediction(
-        imageBytes,
-        mean: _normMean,
-        std: _normStd,
-      );
-      probabilities = await _pytorchModel!.getImagePredictionList(
-        imageBytes,
-        mean: _normMean,
-        std: _normStd,
-      );
+      _interpreter!.run(inputTensor, outputTensor);
     } catch (e) {
-      throw Exception('Gagal menjalankan inferensi PyTorch Lite: $e');
+      throw Exception('Gagal menjalankan inferensi TFLite: $e');
     }
     stopwatch.stop();
     final int latencyMs = stopwatch.elapsedMilliseconds;
-    final List<double> predictionList =
-        probabilities?.whereType<double>().toList() ?? <double>[];
 
-    final List<double> probs = _softmax(predictionList);
+    final List<double> rawProbs = List<double>.from(outputTensor[0]);
+    final List<double> probs = _softmax(rawProbs);
     final int maxIndex = argmax(probs);
     final double maxScore = probs.isEmpty ? 0.0 : probs[maxIndex];
-    final String detectedChar =
-        (predictionList.isNotEmpty && maxIndex < _labels.length)
-            ? _labels[maxIndex].toUpperCase()
-            : prediction.toUpperCase();
+
+    final String detectedChar = (maxIndex < _labels.length)
+        ? _labels[maxIndex].toUpperCase()
+        : 'CLASS_$maxIndex';
 
     return {
       'label': detectedChar,
       'confidence': maxScore,
       'latency_ms': latencyMs,
-      'processed_image_path': pluginFile.path,
+      'processed_image_path': previewFile.path,
     };
   }
 
-  /// Memindai baris/kalimat Braille, mengelompokkan per sel, 
-  /// mendeteksi spasi antar kata, dan menghitung koordinat Bounding Box presisi.
+  /// Memproses citra dokumen berapapun jumlah barisnya
   Future<Map<String, dynamic>> predictDocument(img.Image lineImage) async {
     if (!isLoaded) {
       throw Exception('Model belum siap dipakai.');
@@ -573,15 +669,16 @@ class BrailleClassifier {
 
     final img.Image gray = img.grayscale(lineImage);
     final img.Image grayW = _workingScale(gray);
-    final img.Image blackHat = _blackHatMorphology(grayW);
+    final img.Image enhanced = _enhanceLocalContrast(grayW);
+    final img.Image blackHat = _blackHatMorphology(enhanced);
     final img.Image binaryHat = _binarizeOtsu(img.invert(blackHat));
     List<_Blob> blobs = _connectedBlackComponents(binaryHat);
     if (blobs.isEmpty) {
-      blobs = _connectedBlackComponents(_binarizeOtsu(grayW));
+      blobs = _connectedBlackComponents(_binarizeOtsu(enhanced));
     }
     blobs = _filterBlobs(blobs);
 
-    print('--> [LINE] Titik terdeteksi: ${blobs.length}');
+    print('--> [MULTI-LINE] Total bintik terdeteksi: ${blobs.length}');
     if (blobs.isEmpty) {
       return {
         'text': '',
@@ -593,85 +690,103 @@ class BrailleClassifier {
     final double scaleX = lineImage.width / grayW.width;
     final double scaleY = lineImage.height / grayW.height;
 
-    final List<List<_Blob>> cells = _clusterCells(blobs);
-    print('--> [LINE] Sel Braille terdeteksi: ${cells.length}');
+    // 1. Pemisahan Baris Teks Nyata
+    final List<List<_Blob>> lines = splitIntoLines(blobs);
+    print('--> [MULTI-LINE] Jumlah baris terdeteksi: ${lines.length}');
 
     final List<BrailleCellInfo> allCellInfos = [];
-    final StringBuffer sentenceBuffer = StringBuffer();
+    final List<String> recognizedLines = [];
     final stopwatch = Stopwatch()..start();
 
-    // Estimasi batas spasi antar kata
-    final List<double> cellSpans = cells.map((cell) {
-      final double minX = cell.map((b) => b.minX.toDouble()).reduce(math.min);
-      final double maxX = cell.map((b) => b.maxX.toDouble()).reduce(math.max);
-      return maxX - minX;
-    }).toList()..sort();
-    final double avgCellWidth =
-        cellSpans.isNotEmpty ? cellSpans[cellSpans.length ~/ 2] : 20.0;
-    final double spaceThreshold = math.max(25.0, avgCellWidth * 1.8);
+    // 2. Baca tiap baris secara berurutan
+    for (int lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+      final List<_Blob> lineBlobs = lines[lineIdx];
+      final List<List<_Blob>> cells = clusterCells(lineBlobs);
+      if (cells.isEmpty) continue;
 
-    double lastCellMaxX = -1.0;
+      final StringBuffer lineBuffer = StringBuffer();
 
-    for (int i = 0; i < cells.length; i++) {
-      final List<_Blob> cellBlobs = cells[i];
+      final List<double> cellCenters = cells.map((c) {
+        final double minX = c.map((b) => b.minX.toDouble()).reduce(math.min);
+        final double maxX = c.map((b) => b.maxX.toDouble()).reduce(math.max);
+        return (minX + maxX) / 2.0;
+      }).toList();
 
-      final double cellMinX =
-          cellBlobs.map((b) => b.minX.toDouble()).reduce(math.min);
-      final double cellMaxX =
-          cellBlobs.map((b) => b.maxX.toDouble()).reduce(math.max);
-      final double cellMinY =
-          cellBlobs.map((b) => b.minY.toDouble()).reduce(math.min);
-      final double cellMaxY =
-          cellBlobs.map((b) => b.maxY.toDouble()).reduce(math.max);
-
-      // Sisipkan SPASI bila jeda horizontal antar sel lebar
-      if (lastCellMaxX > 0 && (cellMinX - lastCellMaxX) > spaceThreshold) {
-        sentenceBuffer.write(' ');
+      final List<double> centerGaps = [];
+      for (int i = 1; i < cellCenters.length; i++) {
+        centerGaps.add(cellCenters[i] - cellCenters[i - 1]);
       }
-      lastCellMaxX = cellMaxX;
+      centerGaps.sort();
 
-      final img.Image cellCanvas = _gridToCanvas(_blobsToGrid(cellBlobs));
-      final Map<String, dynamic> result = await predict(
-        cellCanvas,
-        cleanPattern: true,
-        fileSuffix: 'line_c$i',
-      );
+      final double baseLetterGap = centerGaps.isNotEmpty
+          ? centerGaps[centerGaps.length ~/ 2]
+          : 35.0;
+      final double spaceThreshold = baseLetterGap * 1.35;
 
-      final String label = (result['label'] ?? '?').toString();
-      sentenceBuffer.write(label);
+      for (int i = 0; i < cells.length; i++) {
+        final List<_Blob> cellBlobs = cells[i];
 
-      // Konversi ke koordinat resolusi asli
-      final double origMinX = cellMinX * scaleX;
-      final double origMaxX = cellMaxX * scaleX;
-      final double origMinY = cellMinY * scaleY;
-      final double origMaxY = cellMaxY * scaleY;
+        final double cellMinX =
+            cellBlobs.map((b) => b.minX.toDouble()).reduce(math.min);
+        final double cellMaxX =
+            cellBlobs.map((b) => b.maxX.toDouble()).reduce(math.max);
+        final double cellMinY =
+            cellBlobs.map((b) => b.minY.toDouble()).reduce(math.min);
+        final double cellMaxY =
+            cellBlobs.map((b) => b.maxY.toDouble()).reduce(math.max);
 
-      final double boxW =
-          math.max(origMaxX - origMinX + 16, (origMaxY - origMinY) * 0.7);
-      final double boxH = origMaxY - origMinY + 20;
-      final double boxCx = (origMinX + origMaxX) / 2.0;
-      final double boxCy = (origMinY + origMaxY) / 2.0;
+        // Sisipkan spasi jika ada pemisah kata
+        if (i > 0) {
+          final double distFromPrev = cellCenters[i] - cellCenters[i - 1];
+          if (distFromPrev > spaceThreshold) {
+            lineBuffer.write(' ');
+          }
+        }
 
-      allCellInfos.add(
-        BrailleCellInfo(
-          label: label,
-          confidence: (result['confidence'] as num?)?.toDouble() ?? 0.0,
-          boundingBox: Rect.fromCenter(
-            center: Offset(boxCx, boxCy),
-            width: boxW,
-            height: boxH,
+        final img.Image cellCanvas = _gridToCanvas(_blobsToGrid(cellBlobs));
+        final Map<String, dynamic> result = await predict(
+          cellCanvas,
+          cleanPattern: true,
+          fileSuffix: 'cell_${lineIdx}_$i',
+        );
+
+        final String label = (result['label'] ?? '?').toString();
+        lineBuffer.write(label);
+
+        final double origMinX = cellMinX * scaleX;
+        final double origMaxX = cellMaxX * scaleX;
+        final double origMinY = cellMinY * scaleY;
+        final double origMaxY = cellMaxY * scaleY;
+
+        final double boxW =
+            math.max(origMaxX - origMinX + 16, (origMaxY - origMinY) * 0.7);
+        final double boxH = origMaxY - origMinY + 20;
+        final double boxCx = (origMinX + origMaxX) / 2.0;
+        final double boxCy = (origMinY + origMaxY) / 2.0;
+
+        allCellInfos.add(
+          BrailleCellInfo(
+            label: label,
+            confidence: (result['confidence'] as num?)?.toDouble() ?? 0.0,
+            boundingBox: Rect.fromCenter(
+              center: Offset(boxCx, boxCy),
+              width: boxW,
+              height: boxH,
+            ),
+            imagePath: (result['processed_image_path'] as String?) ?? '',
           ),
-          imagePath: (result['processed_image_path'] as String?) ?? '',
-        ),
-      );
+        );
+      }
+
+      recognizedLines.add(lineBuffer.toString());
     }
 
     stopwatch.stop();
-    final String finalSentence = sentenceBuffer.toString();
-    print('--> [LINE] Kalimat Terbentuk: "$finalSentence"');
+    final String fullText = recognizedLines.join('\n');
+    print('--> [HASIL AKHIR PEMINDAIAN]:\n$fullText');
 
     return {
-      'text': finalSentence,
+      'text': fullText,
       'cells': allCellInfos,
       'latency_ms': stopwatch.elapsedMilliseconds,
     };
@@ -684,7 +799,8 @@ class BrailleClassifier {
   }
 
   void dispose() {
-    _pytorchModel = null;
+    _interpreter?.close();
+    _interpreter = null;
     _labels = [];
     _isModelLoaded = false;
   }
