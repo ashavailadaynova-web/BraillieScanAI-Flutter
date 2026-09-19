@@ -25,9 +25,10 @@ class BrailleCellInfo {
 
 /// Alias kompatibilitas unit test
 class BrailleCell {
-  final List<_Blob> blobs;
-  BrailleCell(this.blobs);
-  int get dotCount => blobs.length;
+  final List<_Blob> _blobs;
+  BrailleCell(this._blobs);
+  int get dotCount => _blobs.length;
+  double get minX => _blobs.map((b) => b.minX.toDouble()).reduce(math.min);
 }
 
 class BrailleClassifier {
@@ -355,7 +356,7 @@ class BrailleClassifier {
     return (sorted[mid - 1] + sorted[mid]) / 2.0;
   }
 
-  List<_Blob> detectBlobs(img.Image imageInput) {
+  List<_Blob> _detectBlobs(img.Image imageInput) {
     final img.Image gray = img.grayscale(imageInput);
     final img.Image grayW = _workingScale(gray);
     final img.Image enhanced = _enhanceLocalContrast(grayW);
@@ -369,7 +370,7 @@ class BrailleClassifier {
   }
 
   /// Segmentasi Multi-Baris Dinamis: Menjaga 1 sel Braille utuh dan hanya memotong saat jeda antar-baris nyata
-  List<List<_Blob>> splitIntoLines(List<_Blob> blobs) {
+  List<List<_Blob>> _splitIntoLines(List<_Blob> blobs) {
     if (blobs.isEmpty) return [];
 
     final List<_Blob> byY = List<_Blob>.from(blobs)
@@ -407,7 +408,7 @@ class BrailleClassifier {
   }
 
   /// Klasterisasi horizontal sel Braille per baris (Presisi teruji tanpa memecah huruf)
-  List<List<_Blob>> clusterCells(List<_Blob> blobs) {
+  List<List<_Blob>> _clusterCells(List<_Blob> blobs) {
     if (blobs.isEmpty) return <List<_Blob>>[];
 
     final List<_Blob> byX = List<_Blob>.from(blobs)
@@ -473,11 +474,11 @@ class BrailleClassifier {
   }
 
   List<BrailleCell> segmentCellsForTest(img.Image image) {
-    final blobs = detectBlobs(image);
-    final lines = splitIntoLines(blobs);
+    final blobs = _detectBlobs(image);
+    final lines = _splitIntoLines(blobs);
     final List<BrailleCell> allCells = [];
     for (final line in lines) {
-      final clusters = clusterCells(line);
+      final clusters = _clusterCells(line);
       allCells.addAll(clusters.map((c) => BrailleCell(c)));
     }
     return allCells;
@@ -691,7 +692,7 @@ class BrailleClassifier {
     final double scaleY = lineImage.height / grayW.height;
 
     // 1. Pemisahan Baris Teks Nyata
-    final List<List<_Blob>> lines = splitIntoLines(blobs);
+    final List<List<_Blob>> lines = _splitIntoLines(blobs);
     print('--> [MULTI-LINE] Jumlah baris terdeteksi: ${lines.length}');
 
     final List<BrailleCellInfo> allCellInfos = [];
@@ -701,7 +702,7 @@ class BrailleClassifier {
     // 2. Baca tiap baris secara berurutan
     for (int lineIdx = 0; lineIdx < lines.length; lineIdx++) {
       final List<_Blob> lineBlobs = lines[lineIdx];
-      final List<List<_Blob>> cells = clusterCells(lineBlobs);
+      final List<List<_Blob>> cells = _clusterCells(lineBlobs);
       if (cells.isEmpty) continue;
 
       final StringBuffer lineBuffer = StringBuffer();

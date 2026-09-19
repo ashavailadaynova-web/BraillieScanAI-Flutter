@@ -1,4 +1,5 @@
 import org.gradle.api.Project
+import org.gradle.api.file.Directory
 
 allprojects {
     repositories {
@@ -7,16 +8,14 @@ allprojects {
     }
 }
 
-val newBuildDir: Directory =
-    rootProject.layout.buildDirectory
-        .dir("../../build")
-        .get()
+val newBuildDir = rootProject.layout.buildDirectory.dir("../../build").get()
 rootProject.layout.buildDirectory.value(newBuildDir)
 
 subprojects {
-    val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
+    val newSubprojectBuildDir = newBuildDir.dir(project.name)
     project.layout.buildDirectory.value(newSubprojectBuildDir)
 }
+
 subprojects {
     project.evaluationDependsOn(":app")
 }
@@ -26,15 +25,23 @@ fun applyNamespaceFallback(sub: Project) {
     val getter = android::class.java.methods
         .firstOrNull { it.name == "getNamespace" && it.parameterCount == 0 } ?: return
     val currentNs = getter.invoke(android) as? String
-    if (currentNs == null) {
-        val groupStr = sub.group.toString()
-        val fallback = groupStr.takeIf { it.isNotBlank() && it != "unspecified" }
-            ?: "com.example.${sub.name.replace(":", "")}"
+    if (currentNs.isNullOrBlank()) {
+        val cleanName = sub.name.replace(":", "").replace("-", "_")
+        val fallback = when (cleanName) {
+            "image_picker_android" -> "io.flutter.plugins.imagepicker"
+            "camera_android_camerax" -> "io.flutter.plugins.camerax"
+            "flutter_plugin_android_lifecycle" -> "io.flutter.plugins.flutter_plugin_android_lifecycle"
+            "image_cropper" -> "vn.hunghd.flutter.plugins.imagecropper"
+            "tflite_flutter" -> "org.tensorflow.tflite_flutter"
+            "jni" -> "com.github.dart_lang.jni"
+            "jni_flutter" -> "com.github.dart_lang.jni_flutter"
+            else -> "com.braillescan.plugin.$cleanName"
+        }
         try {
             android::class.java
                 .getMethod("setNamespace", String::class.java)
                 .invoke(android, fallback)
-            println("--> PAKAI namespace fallback untuk :${sub.name} = $fallback")
+            println("--> Sukses set namespace unik :${sub.name} = $fallback")
         } catch (e: Exception) {
             println("--> GAGAL set namespace untuk :${sub.name}: ${e.message}")
         }
